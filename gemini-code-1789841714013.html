@@ -1,0 +1,773 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Concentric Ring Escape Simulator</title>
+  
+  <script src="https://unpkg.com/mp4-muxer/build/mp4-muxer.js"></script>
+  
+  <style>
+    body {
+      margin: 0;
+      background: #0f0f13;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      overflow: hidden;
+      color: #fff;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    }
+    canvas {
+      border-radius: 8px;
+      box-shadow: 0 0 30px rgba(0,0,0,0.9);
+      background: #15151a;
+      max-width: 95vw;
+      max-height: 95vh;
+      object-fit: contain;
+    }
+    #ui-panel {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      background: rgba(30, 30, 35, 0.8);
+      padding: 15px 20px;
+      border-radius: 8px;
+      border: 1px solid #333;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      backdrop-filter: blur(4px);
+      z-index: 10;
+      max-height: 90vh;
+      overflow-y: auto;
+    }
+    label {
+      font-size: 14px;
+      font-weight: bold;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+    }
+    select, input[type="number"] {
+      width: 80px;
+      padding: 5px;
+      border-radius: 4px;
+      border: 1px solid #555;
+      background: #222;
+      color: #fff;
+      font-weight: bold;
+    }
+    button {
+      background: #00ffcc;
+      color: #000;
+      border: none;
+      padding: 8px 12px;
+      border-radius: 4px;
+      font-weight: bold;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    button:hover:not(:disabled) {
+      background: #00e6b8;
+    }
+    button:disabled {
+      background: #555;
+      color: #888;
+      cursor: not-allowed;
+    }
+    #renderBtn {
+      background: #ff0055;
+      color: white;
+    }
+    #renderBtn:hover:not(:disabled) {
+      background: #ff3377;
+    }
+    #fullscreenBtn {
+      background: #8844ff;
+      color: white;
+    }
+    #fullscreenBtn:hover:not(:disabled) {
+      background: #aa66ff;
+    }
+  </style>
+</head>
+<body>
+
+<div id="ui-panel">
+  <label>Resolution:
+    <select id="resolution">
+      <option value="720">720p</option>
+      <option value="1080" selected>1080p</option>
+      <option value="1440">1440p</option>
+    </select>
+  </label>
+  <label>Aspect Ratio:
+    <select id="aspectRatio">
+      <option value="16:9">16:9</option>
+      <option value="9:16">9:16</option>
+      <option value="1:1">1:1</option>
+      <option value="4:3">4:3</option>
+      <option value="3:4">3:4</option>
+    </select>
+  </label>
+  <label>Max Duration (s): 
+    <input type="number" id="maxDuration" min="2" max="300" value="180" />
+  </label>
+  <button id="restartBtn">Play Simulation</button>
+  <button id="renderBtn">Render Video</button>
+  <button id="fullscreenBtn">Fullscreen</button>
+</div>
+
+<canvas id="simCanvas"></canvas>
+
+<script>
+const canvas = document.getElementById('simCanvas');
+const ctx = canvas.getContext('2d');
+
+let center = { x: 0, y: 0 };
+
+// --- Audio System ---
+let audioCtx = null;
+let masterGain = null;
+let isHeadless = false;
+
+// Custom fast-render trackers
+let isRenderingVideo = false;
+let renderAudioEvents = [];
+let renderFrameCount = 0;
+
+function initAudio() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    masterGain = audioCtx.createGain();
+    masterGain.connect(audioCtx.destination);
+  }
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+}
+
+function playChime(freq = 440, type = 'sine') {
+  if (!audioCtx || isHeadless) return; 
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+  gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.3);
+  osc.connect(gain);
+  gain.connect(masterGain); 
+  osc.start();
+  osc.stop(audioCtx.currentTime + 0.3);
+}
+
+// --- Seeded PRNG ---
+let seed = 12345;
+let baseSeed = 12345;
+
+function seededRandom() {
+  let t = seed += 0x6D2B79F5;
+  t = Math.imul(t ^ t >>> 15, t | 1);
+  t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+  return ((t ^ t >>> 14) >>> 0) / 4294967296;
+}
+
+// --- Physics Base Parameters (Resolution Independent) ---
+const baseGravity = 0.2;
+const bounce = 1.02;     
+const baseMaxSpeed = 16;   
+const baseMinRadius = 40;
+const gapSizeAngle = Math.PI / 4; 
+
+let scale = 1;
+let maxRadius = 380; 
+let rings = [];
+let ball = null;
+let simulationRunning = true;
+let animationId = null;
+
+// --- Frame Limiting Variables ---
+let then = performance.now();
+const fpsInterval = 1000 / 60; 
+
+class Ball {
+  constructor(x, y) {
+    this.x = x;
+    this.y = y;
+    this.vx = (seededRandom() - 0.5) * 8 * scale;
+    this.vy = (seededRandom() - 0.5) * 8 * scale;
+    this.radius = 8 * scale;
+    this.color = '#ffffff'; 
+  }
+
+  update() {
+    this.vy += baseGravity * scale;
+    this.x += this.vx;
+    this.y += this.vy;
+
+    const currentSpeed = Math.hypot(this.vx, this.vy);
+    const scaledMaxSpeed = baseMaxSpeed * scale;
+    if (currentSpeed > scaledMaxSpeed) {
+      this.vx = (this.vx / currentSpeed) * scaledMaxSpeed;
+      this.vy = (this.vy / currentSpeed) * scaledMaxSpeed;
+    }
+
+    this.checkCollisions();
+  }
+
+  checkCollisions() {
+    const activeRing = rings.find(r => !r.broken);
+    
+    if (!activeRing) {
+      simulationRunning = false;
+      return;
+    }
+
+    const dx = this.x - center.x;
+    const dy = this.y - center.y;
+    const dist = Math.hypot(dx, dy);
+
+    if (dist + this.radius >= activeRing.radius) {
+      let ballAngle = Math.atan2(dy, dx);
+      let relativeAngle = (ballAngle - activeRing.angle) % (2 * Math.PI);
+      if (relativeAngle < 0) relativeAngle += 2 * Math.PI;
+
+      if (relativeAngle < gapSizeAngle) {
+        activeRing.broken = true;
+        const freq = 600 - (activeRing.radius / scale);
+        
+        if (isRenderingVideo) renderAudioEvents.push({ freq: freq, type: 'triangle', time: renderFrameCount / 60 });
+        else playChime(freq, 'triangle'); 
+        
+        this.vx *= 1.1;
+        this.vy *= 1.1;
+      } else {
+        const outX = dx / dist;
+        const outY = dy / dist;
+
+        this.x = center.x + outX * (activeRing.radius - this.radius - (2 * scale));
+        this.y = center.y + outY * (activeRing.radius - this.radius - (2 * scale));
+
+        const inX = -outX;
+        const inY = -outY;
+        const normalAngle = Math.atan2(inY, inX);
+        
+        const maxDeviation = (Math.PI / 2) * 0.9; 
+        const randomBounceAngle = normalAngle + (seededRandom() * 2 * maxDeviation - maxDeviation);
+        
+        const speed = Math.hypot(this.vx, this.vy) * bounce;
+        this.vx = Math.cos(randomBounceAngle) * speed;
+        this.vy = Math.sin(randomBounceAngle) * speed;
+
+        const freq = 300 + (speed / scale) * 10;
+        if (isRenderingVideo) renderAudioEvents.push({ freq: freq, type: 'sine', time: renderFrameCount / 60 });
+        else playChime(freq, 'sine'); 
+      }
+    }
+  }
+
+  draw() {
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+    ctx.fillStyle = this.color;
+    ctx.fill();
+    ctx.shadowBlur = 15 * scale;
+    ctx.shadowColor = this.color;
+    ctx.closePath();
+    ctx.shadowBlur = 0; 
+  }
+}
+
+function resizeCanvas() {
+  const res = parseInt(document.getElementById('resolution').value);
+  const ratio = document.getElementById('aspectRatio').value;
+  
+  let w, h;
+  switch (ratio) {
+    case '16:9': w = Math.round(res * 16 / 9); h = res; break;
+    case '9:16': w = res; h = Math.round(res * 16 / 9); break;
+    case '4:3':  w = Math.round(res * 4 / 3); h = res; break;
+    case '3:4':  w = res; h = Math.round(res * 4 / 3); break;
+    case '1:1':  w = res; h = res; break;
+  }
+  
+  canvas.width = w;
+  canvas.height = h;
+  
+  center = { x: canvas.width / 2, y: canvas.height / 2 };
+  
+  maxRadius = Math.min(canvas.width, canvas.height) * 0.475;
+  scale = maxRadius / 380; 
+}
+
+function setupSimulationState(count) {
+  simulationRunning = true;
+  rings = [];
+  ball = new Ball(center.x, center.y - 10 * scale);
+  
+  const scaledMinRadius = baseMinRadius * scale;
+  const spacing = count === 1 ? 0 : (maxRadius - scaledMinRadius) / (count - 1);
+
+  for (let i = 0; i < count; i++) {
+    const direction = i % 2 === 0 ? 1 : -1;
+    const speed = direction * (0.01 + seededRandom() * 0.02);
+    const hue = (i / count) * 360;
+    
+    rings.push({
+      radius: scaledMinRadius + (i * spacing),
+      angle: seededRandom() * Math.PI * 2,
+      speed: speed,
+      broken: false,
+      color: `hsl(${hue}, 100%, 50%)`
+    });
+  }
+}
+
+async function calculateExactRings(maxDurationSeconds) {
+  const targetMinFrames = maxDurationSeconds * 60 * 0.65;
+  const targetMaxFrames = maxDurationSeconds * 60 * 0.90; 
+  
+  let bestRings = 1;
+  let closestDiff = Infinity;
+  isHeadless = true;
+  
+  for (let testRings = 1; testRings <= 1000; testRings++) {
+     seed = baseSeed; 
+     setupSimulationState(testRings); 
+     
+     let frames = 0;
+     let chunkStart = performance.now();
+
+     while(simulationRunning && frames <= targetMaxFrames) {
+        rings.forEach(ring => {
+           if (!ring.broken) ring.angle = (ring.angle + ring.speed) % (Math.PI * 2);
+        });
+        ball.update(); 
+        frames++;
+
+        if (frames % 200 === 0 && performance.now() - chunkStart > 15) {
+            await new Promise(r => setTimeout(r, 0));
+            chunkStart = performance.now();
+        }
+     }
+     
+     if (!simulationRunning) {
+         if (frames >= targetMinFrames && frames <= targetMaxFrames) {
+             bestRings = testRings; 
+             break; 
+         } else {
+             let targetMid = (targetMinFrames + targetMaxFrames) / 2;
+             let diff = Math.abs(frames - targetMid);
+             if (diff < closestDiff) {
+                 closestDiff = diff;
+                 bestRings = testRings;
+             }
+         }
+     }
+     await new Promise(r => setTimeout(r, 0));
+  }
+  
+  isHeadless = false;
+  return bestRings;
+}
+
+function extractSafeMeta(meta) {
+  if (!meta || !meta.decoderConfig) return undefined;
+  const config = meta.decoderConfig;
+  
+  let safeConfig = {
+      codec: config.codec,
+      sampleRate: config.sampleRate,
+      numberOfChannels: config.numberOfChannels,
+      codedWidth: config.codedWidth,
+      codedHeight: config.codedHeight,
+      colorSpace: config.colorSpace,
+      hardwareAcceleration: config.hardwareAcceleration,
+      optimizeForLatency: config.optimizeForLatency
+  };
+  
+  if (config.description) {
+      safeConfig.description = new Uint8Array(config.description).buffer;
+  }
+  
+  Object.keys(safeConfig).forEach(key => safeConfig[key] === undefined && delete safeConfig[key]);
+  
+  return { decoderConfig: safeConfig };
+}
+
+// --- High-Speed MP4 Muxing Pipeline ---
+async function renderFastVideo(maxSeconds, optimalRings) {
+  isRenderingVideo = true;
+  renderAudioEvents = [];
+  renderFrameCount = 0;
+  seed = baseSeed;
+  setupSimulationState(optimalRings);
+
+  const muxer = new Mp4Muxer.Muxer({
+      target: new Mp4Muxer.ArrayBufferTarget(),
+      video: { codec: 'avc', width: canvas.width, height: canvas.height },
+      audio: { codec: 'aac', sampleRate: 44100, numberOfChannels: 1 },
+      fastStart: 'in-memory' 
+  });
+
+  let encodedChunks = [];
+
+  const videoEncoder = new VideoEncoder({
+      output: (chunk, meta) => {
+          let buffer = new Uint8Array(chunk.byteLength);
+          chunk.copyTo(buffer);
+          
+          let chunkInit = { type: chunk.type, timestamp: Math.round(chunk.timestamp), data: buffer };
+          chunkInit.duration = chunk.duration ? Math.round(chunk.duration) : Math.round(1e6 / 60);
+          
+          encodedChunks.push({ isVideo: true, timestamp: Math.round(chunk.timestamp), chunkInit: chunkInit, meta: extractSafeMeta(meta) });
+      },
+      error: e => console.error('Video Error:', e)
+  });
+  
+  videoEncoder.configure({
+      codec: 'avc1.640032',
+      width: canvas.width,
+      height: canvas.height,
+      bitrate: 15000000, 
+      framerate: 60,
+      avc: { format: 'avc' }
+  });
+
+  const audioEncoder = new AudioEncoder({
+      output: (chunk, meta) => {
+          let buffer = new Uint8Array(chunk.byteLength);
+          chunk.copyTo(buffer);
+          
+          let chunkInit = { type: chunk.type, timestamp: Math.round(chunk.timestamp), data: buffer };
+          chunkInit.duration = chunk.duration ? Math.round(chunk.duration) : 0;
+          
+          encodedChunks.push({ isVideo: false, timestamp: Math.round(chunk.timestamp), chunkInit: chunkInit, meta: extractSafeMeta(meta) });
+      },
+      error: e => console.error('Audio Error:', e)
+  });
+  
+  audioEncoder.configure({
+      codec: 'mp4a.40.2',
+      sampleRate: 44100,
+      numberOfChannels: 1,
+      bitrate: 128000
+  });
+
+  let chunkStart = performance.now();
+  const estimatedFrames = maxSeconds * 60;
+
+  while (simulationRunning) {
+      while (videoEncoder.encodeQueueSize > 5) {
+          await new Promise(r => setTimeout(r, 5));
+      }
+
+      rings.forEach(ring => {
+         if (!ring.broken) ring.angle = (ring.angle + ring.speed) % (Math.PI * 2);
+      });
+      ball.update();
+
+      ctx.fillStyle = 'rgba(21, 21, 26, 0.2)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      rings.forEach((ring, index) => {
+          if (ring.broken) return;
+          ctx.beginPath();
+          ctx.arc(center.x, center.y, ring.radius, ring.angle + gapSizeAngle, ring.angle + Math.PI * 2);
+          const isActive = rings.findIndex(r => !r.broken) === index;
+          ctx.strokeStyle = isActive ? '#ffffff' : ring.color;
+          ctx.lineWidth = isActive ? 4 * scale : 2 * scale;
+          ctx.stroke();
+      });
+      ball.draw();
+
+      const frame = new VideoFrame(canvas, { 
+          timestamp: Math.round(renderFrameCount * 1e6 / 60),
+          duration: Math.round(1e6 / 60)
+      });
+      videoEncoder.encode(frame, { keyFrame: renderFrameCount % 60 === 0 });
+      frame.close();
+
+      renderFrameCount++;
+
+      if (renderFrameCount % 60 === 0) {
+          const cleanState = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          
+          ctx.fillStyle = 'rgba(21, 21, 26, 0.7)';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.fillStyle = '#00ffcc';
+          ctx.font = `bold ${36 * scale}px sans-serif`;
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          const percent = Math.min(100, Math.round((renderFrameCount / estimatedFrames) * 100));
+          ctx.fillText(`RENDERING VIDEO: ${percent}%`, center.x, center.y);
+          
+          await new Promise(r => requestAnimationFrame(r)); 
+          chunkStart = performance.now();
+          
+          ctx.putImageData(cleanState, 0, 0);
+      } else if (renderFrameCount % 50 === 0 && performance.now() - chunkStart > 15) {
+          await new Promise(r => setTimeout(r, 0)); 
+          chunkStart = performance.now();
+      }
+  }
+
+  ctx.fillStyle = 'rgba(21, 21, 26, 0.8)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#00ffcc';
+  ctx.font = `bold ${48 * scale}px sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('SIMULATION COMPLETE', center.x, center.y);
+  
+  const finalFrame = new VideoFrame(canvas, { 
+      timestamp: Math.round(renderFrameCount * 1e6 / 60),
+      duration: Math.round(1e6 / 60)
+  });
+  videoEncoder.encode(finalFrame, { keyFrame: true });
+  finalFrame.close();
+
+  await videoEncoder.flush();
+
+  ctx.fillStyle = 'rgba(21, 21, 26, 0.9)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#00ffcc';
+  ctx.fillText('ENCODING AUDIO...', center.x, center.y);
+  await new Promise(r => requestAnimationFrame(r)); 
+
+  const exactDuration = (renderFrameCount + 1) / 60;
+  const offlineCtx = new OfflineAudioContext(1, Math.ceil(44100 * exactDuration) || 44100, 44100);
+  
+  renderAudioEvents.forEach(evt => {
+      const osc = offlineCtx.createOscillator();
+      const gain = offlineCtx.createGain();
+      osc.type = evt.type;
+      osc.frequency.setValueAtTime(evt.freq, evt.time);
+      gain.gain.setValueAtTime(0.3, evt.time);
+      gain.gain.exponentialRampToValueAtTime(0.001, evt.time + 0.3);
+      osc.connect(gain);
+      gain.connect(offlineCtx.destination);
+      osc.start(evt.time);
+      osc.stop(evt.time + 0.3);
+  });
+  
+  const audioBuffer = await offlineCtx.startRendering();
+  const channelData = audioBuffer.getChannelData(0);
+  const chunkSize = 44100;
+  
+  for (let i = 0; i < channelData.length; i += chunkSize) {
+      while (audioEncoder.encodeQueueSize > 5) {
+          await new Promise(r => setTimeout(r, 5));
+      }
+
+      const chunkLength = Math.min(chunkSize, channelData.length - i);
+      const data = channelData.slice(i, i + chunkLength);
+      const audioData = new AudioData({
+          format: 'f32-planar',
+          sampleRate: 44100,
+          numberOfFrames: data.length,
+          numberOfChannels: 1,
+          timestamp: Math.round((i / 44100) * 1e6),
+          data: data
+      });
+      audioEncoder.encode(audioData);
+      audioData.close();
+  }
+
+  await audioEncoder.flush();
+  
+  ctx.fillStyle = 'rgba(21, 21, 26, 1.0)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#00ffcc';
+  ctx.fillText('FINALIZING FILE... 0%', center.x, center.y);
+  await new Promise(r => requestAnimationFrame(r)); 
+  
+  encodedChunks.sort((a, b) => a.timestamp - b.timestamp);
+  
+  let finalCount = 0;
+  for (const item of encodedChunks) {
+      try {
+          if (item.isVideo) {
+              muxer.addVideoChunk(new EncodedVideoChunk(item.chunkInit), item.meta);
+          } else {
+              muxer.addAudioChunk(new EncodedAudioChunk(item.chunkInit), item.meta);
+          }
+      } catch (e) {
+          if (item.isVideo) {
+              muxer.addVideoChunk(new EncodedVideoChunk(item.chunkInit));
+          } else {
+              muxer.addAudioChunk(new EncodedAudioChunk(item.chunkInit));
+          }
+      }
+      
+      finalCount++;
+      
+      if (finalCount % 50 === 0) {
+          ctx.fillStyle = 'rgba(21, 21, 26, 1.0)';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.fillStyle = '#00ffcc';
+          const pct = Math.round((finalCount / encodedChunks.length) * 100);
+          ctx.fillText(`FINALIZING FILE... ${pct}%`, center.x, center.y);
+          await new Promise(r => setTimeout(r, 0));
+      }
+  }
+
+  muxer.finalize();
+
+  const buffer = muxer.target.buffer;
+  const blob = new Blob([buffer], { type: 'video/mp4' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `simulation_${document.getElementById('resolution').value}p_${document.getElementById('aspectRatio').value.replace(':','x')}.mp4`;
+  a.click();
+
+  ctx.fillStyle = '#15151a';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#00ffcc';
+  ctx.fillText('RENDER COMPLETE!', center.x, center.y);
+
+  isRenderingVideo = false;
+  document.getElementById('restartBtn').disabled = false;
+  document.getElementById('renderBtn').disabled = false;
+}
+
+async function initSimulation(startRender = false) {
+  if (!audioCtx) initAudio();
+  if (animationId) cancelAnimationFrame(animationId);
+  
+  document.getElementById('restartBtn').disabled = true;
+  document.getElementById('renderBtn').disabled = true;
+
+  resizeCanvas();
+  
+  ctx.fillStyle = '#15151a';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#00ffcc';
+  ctx.font = `bold ${36 * scale}px sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('CALCULATING...', center.x, center.y);
+
+  baseSeed = Math.random() * 1000000; 
+  const maxSeconds = parseFloat(document.getElementById('maxDuration').value) || 10;
+  
+  const optimalRings = await calculateExactRings(maxSeconds);
+  
+  if (startRender) {
+      await renderFastVideo(maxSeconds, optimalRings);
+  } else {
+      seed = baseSeed;
+      setupSimulationState(optimalRings);
+      then = performance.now(); 
+      document.getElementById('restartBtn').disabled = false;
+      document.getElementById('renderBtn').disabled = false;
+      animate();
+  }
+}
+
+function animate(time) {
+  animationId = requestAnimationFrame(animate);
+  
+  const now = time || performance.now();
+  const elapsed = now - then;
+  
+  if (elapsed < fpsInterval) return; 
+  then = now - (elapsed % fpsInterval);
+
+  ctx.fillStyle = 'rgba(21, 21, 26, 0.2)'; 
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  rings.forEach((ring, index) => {
+    if (ring.broken) return;
+
+    ring.angle = (ring.angle + ring.speed) % (Math.PI * 2);
+
+    ctx.beginPath();
+    ctx.arc(center.x, center.y, ring.radius, ring.angle + gapSizeAngle, ring.angle + Math.PI * 2);
+    
+    const isActive = rings.findIndex(r => !r.broken) === index;
+    ctx.strokeStyle = isActive ? '#ffffff' : ring.color;
+    ctx.lineWidth = isActive ? 4 * scale : 2 * scale;
+    ctx.stroke();
+  });
+
+  if (simulationRunning) {
+    ball.update();
+    ball.draw();
+  } else {
+    ball.draw();
+    ctx.fillStyle = '#00ffcc';
+    ctx.font = `bold ${48 * scale}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('SIMULATION COMPLETE', center.x, center.y);
+  }
+}
+
+document.getElementById('restartBtn').addEventListener('click', () => initSimulation(false));
+document.getElementById('renderBtn').addEventListener('click', () => initSimulation(true));
+
+// --- Fullscreen & Wake Lock System ---
+let wakeLock = null;
+
+async function handleFullscreenChange() {
+  const isFullscreen = document.fullscreenElement || document.webkitFullscreenElement;
+  const uiPanel = document.getElementById('ui-panel');
+  
+  if (isFullscreen) {
+    uiPanel.style.display = 'none';
+    
+    // Explicitly scale the canvas up to take 100% of the newly available fullscreen resolution
+    canvas.style.width = '100vw';
+    canvas.style.height = '100vh';
+    canvas.style.maxWidth = '100vw';
+    canvas.style.maxHeight = '100vh';
+    canvas.style.borderRadius = '0px';
+    
+    if ('wakeLock' in navigator) {
+      try {
+        wakeLock = await navigator.wakeLock.request('screen');
+      } catch (err) {
+        console.error('Wake Lock error:', err);
+      }
+    }
+  } else {
+    uiPanel.style.display = 'flex';
+    
+    // Revert canvas to original bounds upon exit
+    canvas.style.width = '';
+    canvas.style.height = '';
+    canvas.style.maxWidth = '';
+    canvas.style.maxHeight = '';
+    canvas.style.borderRadius = '';
+    
+    if (wakeLock) {
+      wakeLock.release().then(() => { wakeLock = null; });
+    }
+  }
+}
+
+document.addEventListener('fullscreenchange', handleFullscreenChange);
+document.addEventListener('webkitfullscreenchange', handleFullscreenChange);
+
+document.getElementById('fullscreenBtn').addEventListener('click', () => {
+  const isFullscreen = document.fullscreenElement || document.webkitFullscreenElement;
+  if (!isFullscreen) {
+    if (document.body.requestFullscreen) {
+      document.body.requestFullscreen();
+    } else if (document.body.webkitRequestFullscreen) {
+      document.body.webkitRequestFullscreen();
+    }
+  } else {
+    if (document.exitFullscreen) {
+      document.exitFullscreen();
+    } else if (document.webkitExitFullscreen) {
+      document.webkitExitFullscreen();
+    }
+  }
+});
+
+initSimulation(false);
+</script>
+</body>
+</html>
